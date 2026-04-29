@@ -2,7 +2,8 @@ import chalk from "chalk";
 import ora from "ora";
 import open from "open";
 import { select, input, password, editor, Separator } from "@inquirer/prompts";
-import { PROVIDERS, getProvider, providerHasFreeModelsById, isProviderLocked, type Provider, saveCustomProvider } from "../providers/registry.ts";
+import { PROVIDERS, getProvider, providerHasFreeModelsById, isProviderLocked, saveCustomProvider } from "../providers/registry.ts";
+import type { Provider } from "../providers/registry.ts";
 import { getAdapter } from "../auth/providers/index.ts";
 import { startCallbackListener } from "../auth/server.ts";
 import {
@@ -33,7 +34,7 @@ export async function addCommand(opts: { callbackHost?: string; callbackPort?: s
     } else {
       const adapter = getAdapter(providerId);
       if (!adapter) {
-        console.log(`\n  ${chalk.red("Ã¢Å“â€“")}  No OAuth adapter registered for ${providerId}\n`);
+        console.log(`\n  ${chalk.red("x")}  No OAuth adapter registered for ${providerId}\n`);
         return;
       }
       if (adapter.flow === "device_code")            await runDeviceFlow(providerId);
@@ -47,11 +48,12 @@ export async function addCommand(opts: { callbackHost?: string; callbackPort?: s
   } catch (err: unknown) {
     const e = err as { name?: string; message?: string };
     if (e?.name === "ExitPromptError") { console.log(""); return; }
-    console.error(`\n  ${chalk.red("Ã¢Å“â€“")}  ${e?.message ?? String(err)}\n`);
+    console.error(`\n  ${chalk.red("x")}  ${e?.message ?? String(err)}\n`);
     process.exit(1);
   }
 }
 
+// Provider picker
 
 async function pickProvider(): Promise<string | null> {
   const all = Object.values(PROVIDERS).filter(p => !isProviderLocked(p));
@@ -70,9 +72,9 @@ async function pickProvider(): Promise<string | null> {
   };
 
   const choices: Array<Separator | { name: string; value: string; description?: string }> = [];
-  if (freeOAuth.length) { choices.push(new Separator(chalk.green("Ã¢â€â‚¬Ã¢â€â‚¬ OAuth Ã¢â‚¬â€ FREE Ã¢â€â‚¬Ã¢â€â‚¬"))); choices.push(...freeOAuth.map(row)); }
-  if (paidOAuth.length) { choices.push(new Separator(chalk.cyan("Ã¢â€â‚¬Ã¢â€â‚¬ OAuth Ã¢â‚¬â€ subscription Ã¢â€â‚¬Ã¢â€â‚¬"))); choices.push(...paidOAuth.map(row)); }
-  if (apiKey.length)    { choices.push(new Separator(chalk.yellow("Ã¢â€â‚¬Ã¢â€â‚¬ API Key Ã¢â€â‚¬Ã¢â€â‚¬"))); choices.push(...apiKey.map(row)); }
+  if (freeOAuth.length) { choices.push(new Separator(chalk.green("-- OAuth - FREE --"))); choices.push(...freeOAuth.map(row)); }
+  if (paidOAuth.length) { choices.push(new Separator(chalk.cyan("-- OAuth - subscription --"))); choices.push(...paidOAuth.map(row)); }
+  if (apiKey.length)    { choices.push(new Separator(chalk.yellow("-- API Key --"))); choices.push(...apiKey.map(row)); }
 
   return await select<string>({
     message: "Which provider do you want to add?",
@@ -81,10 +83,11 @@ async function pickProvider(): Promise<string | null> {
   });
 }
 
+// Device-code flow
 
 async function runDeviceFlow(providerId: string): Promise<void> {
   const p = getProvider(providerId)!;
-  const spinner = ora(`Requesting device code from ${p.name}Ã¢â‚¬Â¦`).start();
+  const spinner = ora(`Requesting device code from ${p.name}...`).start();
 
   let started;
   try {
@@ -107,14 +110,14 @@ async function runDeviceFlow(providerId: string): Promise<void> {
   catch { console.log(chalk.gray("  (Open the URL above manually)")); }
 
   console.log("");
-  const pollSpinner = ora("Waiting for authorizationÃ¢â‚¬Â¦").start();
+  const pollSpinner = ora("Waiting for authorization...").start();
 
   const intervalMs = Math.max(2, started.interval ?? 5) * 1000;
   const deadline = Date.now() + started.expires_in * 1000;
 
   while (Date.now() < deadline) {
     await Bun.sleep(intervalMs);
-    pollSpinner.text = chalk.gray(`Waiting for authorizationÃ¢â‚¬Â¦ ${chalk.yellow(remaining(deadline))}`);
+    pollSpinner.text = chalk.gray(`Waiting for authorization... ${chalk.yellow(remaining(deadline))}`);
 
     const res = await pollDeviceFlow(started.session_id);
     if (res.status === "complete") {
@@ -125,11 +128,12 @@ async function runDeviceFlow(providerId: string): Promise<void> {
     if (res.status === "denied") { pollSpinner.fail("Access denied in the browser."); return; }
     if (res.status === "expired") { pollSpinner.fail("Device code expired."); return; }
     if (res.status === "error")   { pollSpinner.fail(res.message); return; }
-    // pending Ã¢â€ â€™ keep polling
+    // pending -> keep polling
   }
   pollSpinner.fail("Timed out waiting for authorization.");
 }
 
+// Authorization-code flow
 
 async function runAuthCodeFlow(
   providerId: string,
@@ -155,10 +159,11 @@ async function runAuthCodeFlow(
 
   const callbackHost = opts.callbackHost ?? adapter.callbackHost;
   const callbackPort = opts.callbackPort ? parseInt(opts.callbackPort, 10) : (adapter.fixedPort ?? 0);
+  const isHeadless = Boolean(opts.callbackHost);
 
-  if (opts.callbackHost) {
-    console.log(chalk.yellow(`  Remote callback mode: http://${opts.callbackHost}:${callbackPort || "<random>"}/callback`));
-    console.log(chalk.gray("  Make sure this port is open in your VPS firewall before proceeding.\n"));
+  if (isHeadless) {
+    console.log(chalk.yellow(`  Headless mode: callback URL is http://${opts.callbackHost}:${callbackPort || "<random>"}/callback`));
+    console.log(chalk.gray("  Make sure that host:port is reachable from your browser before continuing.\n"));
   }
 
   // Spin up ephemeral listener - wrap in try/finally to guarantee cleanup
@@ -195,16 +200,19 @@ async function runAuthCodeFlow(
     catch { console.log(chalk.gray("  (Open the URL above manually)")); }
 
     console.log("");
-    const spinner = ora("Waiting for callback…").start();
+    const spinner = ora("Waiting for callback...").start();
 
     try {
-      // Race the local callback against an optional manual paste prompt
-      const MANUAL_PROMPT_DELAY_MS = 8000;
+      // After 8 seconds, surface a manual-paste prompt that races the callback
+      // listener — if the callback can't reach the listener (firewall, NAT, no
+      // public IP), the user can paste the redirect URL or just code+state.
+      const MANUAL_PROMPT_DELAY_MS = 8_000;
       const manualPromise: Promise<{ code: string; state: string } | null> = new Promise((resolve) => {
         setTimeout(async () => {
+          spinner.stop();
           try {
             const pasted = await input({
-              message: "Callback didn't arrive? Paste the full redirect URL (or just press Enter to keep waiting):",
+              message: "Callback didn't arrive? Paste the redirect URL or press Enter to keep waiting:",
               default: "",
             });
             if (!pasted.trim()) { resolve(null); return; }
@@ -219,19 +227,38 @@ async function runAuthCodeFlow(
         }, MANUAL_PROMPT_DELAY_MS);
       });
 
-      const result = await Promise.race([
-        listener.wait().then((cap) => ({ kind: "callback" as const, cap })),
-        manualPromise.then((m) => m ? { kind: "manual" as const, cap: { code: m.code, state: m.state, error: null, url: new URL("http://manual/") } } : null),
+      const winner = await Promise.race<
+        { kind: "callback"; capture: Awaited<ReturnType<typeof listener.wait>> } |
+        { kind: "manual"; capture: { code: string; state: string } } |
+        null
+      >([
+        listener.wait().then((c) => ({ kind: "callback" as const, capture: c })),
+        manualPromise.then((m) => m ? { kind: "manual" as const, capture: m } : null),
       ]);
-      if (!result) { spinner.fail("No code received"); return; }
-      const capture = result.cap;
-      if (capture.error) { spinner.fail(`Authorization denied: ${capture.error}`); return; }
-      if (!capture.code || !capture.state) { spinner.fail("Missing code or state in callback"); return; }
 
-      spinner.text = "Exchanging code for tokens…";
-      const connection = await completeAuthCodeFlow(started.session_id, capture.code, capture.state);
-      spinner.succeed(chalk.green("Authorization successful!"));
-      printSavedAccount(connection, p);
+      if (!winner) {
+        spinner.fail("No code received");
+        return;
+      }
+      if (winner.kind === "callback") {
+        const capture = winner.capture;
+        if (capture.error) { spinner.fail(`Authorization denied: ${capture.error}`); return; }
+        if (!capture.code || !capture.state) { spinner.fail("Missing code or state in callback"); return; }
+        spinner.start("Exchanging code for tokens...");
+        const connection = await completeAuthCodeFlow(started.session_id, capture.code, capture.state);
+        spinner.succeed(chalk.green("Authorization successful!"));
+        printSavedAccount(connection, p);
+      } else {
+        const { code, state } = winner.capture;
+        const exchanging = ora("Exchanging code for tokens...").start();
+        try {
+          const connection = await completeAuthCodeFlow(started.session_id, code, state);
+          exchanging.succeed(chalk.green("Authorization successful!"));
+          printSavedAccount(connection, p);
+        } catch (err) {
+          exchanging.fail(err instanceof Error ? err.message : String(err));
+        }
+      }
     } catch (err) {
       spinner.fail(err instanceof Error ? err.message : String(err));
     }
@@ -243,10 +270,10 @@ async function runAuthCodeFlow(
 async function runImportFlow(providerId: string, p: Provider): Promise<void> {
   console.log(chalk.gray(`\n  Paste the access token from ${p.name}.`));
   if (p.id === "cursor") {
-    console.log(chalk.gray("  Find it in Cursor IDE Ã¢â€ â€™ Settings Ã¢â€ â€™ General Ã¢â€ â€™ Access Token."));
+    console.log(chalk.gray("  Find it in Cursor IDE -> Settings -> General -> Access Token."));
   }
   if (p.id === "opencode") {
-    console.log(chalk.gray("  OpenCode is a public shared pool Ã¢â‚¬â€ press Enter to continue."));
+    console.log(chalk.gray("  OpenCode is a public shared pool - press Enter to continue."));
   }
   console.log("");
 
@@ -258,9 +285,9 @@ async function runImportFlow(providerId: string, p: Provider): Promise<void> {
         waitForUserInput: false,
       }).catch(() => "");
 
-  if (!token.trim()) { console.log(chalk.yellow("  Empty token Ã¢â‚¬â€ aborting.\n")); return; }
+  if (!token.trim()) { console.log(chalk.yellow("  Empty token - aborting.\n")); return; }
 
-  const spinner = ora(`Importing ${p.name} tokenÃ¢â‚¬Â¦`).start();
+  const spinner = ora(`Importing ${p.name} token...`).start();
   try {
     const connection = await orchestratorImport(providerId, token.trim());
     spinner.succeed(chalk.green("Token imported"));
@@ -270,6 +297,7 @@ async function runImportFlow(providerId: string, p: Provider): Promise<void> {
   }
 }
 
+// API-key flow
 
 async function runApiKeyFlow(p: Provider): Promise<void> {
   console.log("");
@@ -309,7 +337,7 @@ async function runApiKeyFlow(p: Provider): Promise<void> {
 
   const apiKey = await password({
     message: `${providerToSave.name} API key`,
-    mask: "Ã¢â‚¬Â¢",
+    mask: "*",
     validate: (v) => v.trim() ? true : "API key is required",
   });
 
@@ -338,6 +366,7 @@ async function runApiKeyFlow(p: Provider): Promise<void> {
   }
 }
 
+// Helpers
 
 function remaining(deadline: number): string {
   const s = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
@@ -349,7 +378,7 @@ function remaining(deadline: number): string {
 function printSavedAccount(connection: { id: string; email: string | null; priority: number }, p: Provider): void {
   const label = connection.email ?? connection.id.slice(0, 8);
   console.log("");
-  console.log(`  ${chalk.green("Ã¢Å“â€œ")}  ${p.name} connection saved  ${chalk.gray(`${label} Ã‚Â· priority ${connection.priority}`)}`);
+  console.log(`  ${chalk.green("OK")}  ${p.name} connection saved  ${chalk.gray(`${label} - priority ${connection.priority}`)}`);
   console.log(`  ${chalk.gray("next:")}  ${chalk.cyan("grouter up openclaude")}  ${chalk.gray("to wire up your tool")}`);
 }
 

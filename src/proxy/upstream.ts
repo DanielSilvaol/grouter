@@ -8,14 +8,15 @@
 //                       cline, openrouter, openai (apikey), groq, deepseek, nvidia, ollama,
 //                       gemini (apikey via /v1beta/openai/), gitlab (apikey or OAuth Bearer),
 //                       github-models, sambanova.
-//   ✅ claude-format   — claude (OAuth), anthropic (apikey), kimi-coding.
-//                       Translated via openaiToClaude() + claudeChunkToOpenAI().
+//   ⚠️ claude-format   — claude (OAuth), anthropic (apikey), kimi-coding.
+//                       Needs OpenAI→Anthropic translator. Returns 501 for now.
 //   ⚠️ codex-responses — codex. Uses /responses endpoint, needs translator.
 //   ⚠️ kiro            — AWS CodeWhisperer event-stream binary. Needs translator.
 //   ⚠️ cursor          — Connect-RPC over proto. Needs translator.
 
-import { platform, arch } from "node:os";
+import { arch } from "node:os";
 import type { Connection } from "../types.ts";
+import { parseProviderData, decodeJwtPayload, mapPlatformOs } from "../utils.ts";
 import { buildQwenHeaders, buildQwenUrl, QWEN_SYSTEM_MSG } from "../constants.ts";
 import { getProvider } from "../providers/registry.ts";
 import {
@@ -23,8 +24,8 @@ import {
   buildClaudeHeaders,
   buildKimiCodingHeaders,
 } from "./claude-translator.ts";
-import { openaiToGemini } from "./gemini-translator.ts";
 import { openaiToCodexResponses } from "./codex-translator.ts";
+import { openaiToGemini } from "./gemini-translator.ts";
 
 export interface UpstreamRequest {
   url: string;
@@ -42,21 +43,7 @@ interface BuildContext {
   stream: boolean;
 }
 
-function parseProviderData(raw: string | null): Record<string, unknown> | null {
-  if (!raw) return null;
-  try { return JSON.parse(raw) as Record<string, unknown>; } catch { return null; }
-}
 
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const parts = token.split(".");
-  const payload = parts[1];
-  if (!payload) return null;
-  try {
-    return JSON.parse(Buffer.from(payload, "base64url").toString("utf-8")) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
 
 function extractCodexAccountId(token: string, providerData: Record<string, unknown> | null): string | null {
   const fromProviderData = typeof providerData?.accountId === "string" ? providerData.accountId : null;
@@ -81,23 +68,12 @@ function extractCodexAccountId(token: string, providerData: Record<string, unkno
 
   return null;
 }
+
+
+
 // ── Header helpers ───────────────────────────────────────────────────────────
 
-function mapStainlessOs(): string {
-  const p = platform();
-  if (p === "darwin") return "MacOS";
-  if (p === "win32")  return "Windows";
-  return "Linux";
-}
 
-function buildKimiHeaders(): Record<string, string> {
-  return {
-    "X-Msh-Platform":     "9router",
-    "X-Msh-Version":      "2.1.2",
-    "X-Msh-Device-Model": `${platform()} ${arch()}`,
-    "X-Msh-Device-Id":    `kimi-${Date.now()}`,
-  };
-}
 
 function buildCopilotHeaders(copilotToken: string, stream: boolean): Record<string, string> {
   return {
@@ -119,7 +95,23 @@ function buildCopilotHeaders(copilotToken: string, stream: boolean): Record<stri
 const OPENAI_EXTRA_FIELDS = ["store", "metadata", "service_tier", "logprobs", "top_logprobs", "logit_bias"];
 
 // Providers that don't accept OpenAI-specific extra fields
-const STRICT_COMPAT_PROVIDERS = new Set(["cerebras", "mistral", "together", "chutes", "huggingface", "sambanova"]);
+const STRICT_COMPAT_PROVIDERS = new Set(["cerebras", "mistral", "together", "chutes", "huggingface", "sambanova", "groq"]);
+
+const SAMBANOVA_MODEL_ALIASES: Record<string, string> = {
+  "llama-3.3-70b-versatile": "Meta-Llama-3.3-70B-Instruct",
+  "meta-llama/llama-3.3-70b-instruct": "Meta-Llama-3.3-70B-Instruct",
+  "meta-llama-3.3-70b-instruct": "Meta-Llama-3.3-70B-Instruct",
+  "llama-4-maverick-17b-128e-instruct": "Llama-4-Maverick-17B-128E-Instruct",
+};
+
+function normalizeSambaNovaBody(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...body };
+  const rawModel = typeof out.model === "string" ? out.model.trim() : "";
+  if (!rawModel) return out;
+  const alias = SAMBANOVA_MODEL_ALIASES[rawModel.toLowerCase()];
+  if (alias) out.model = alias;
+  return out;
+}
 
 function stripExtraFields(body: Record<string, unknown>): Record<string, unknown> {
   const out = { ...body };
@@ -181,7 +173,7 @@ function buildCodexHeaders(token: string, accountId: string | null, stream: bool
     "Authorization": `Bearer ${token}`,
     "Accept": stream ? "text/event-stream" : "application/json",
     "originator": "codex_cli_rs",
-    "User-Agent": `codex_cli_rs/0.0.1 (${mapStainlessOs()}; ${arch()})`,
+    "User-Agent": `codex_cli_rs/0.0.1 (${mapPlatformOs()}; ${arch()})`,
   };
   if (accountId) headers["ChatGPT-Account-ID"] = accountId;
   return headers;
@@ -243,7 +235,11 @@ export function buildUpstream(ctx: BuildContext): UpstreamResult {
     };
     const url = urls[provider];
     if (url) {
-      return { kind: "ok", req: openaiCompat(url, apiKey, ctx.body, ctx.stream) };
+      if (provider === "sambanova") {
+        return { kind: "ok", req: openaiCompat(url, apiKey, normalizeSambaNovaBody(ctx.body), ctx.stream, {}, true) };
+      }
+      const strict = STRICT_COMPAT_PROVIDERS.has(provider);
+      return { kind: "ok", req: openaiCompat(url, apiKey, ctx.body, ctx.stream, {}, strict) };
     }
     // Anthropic API-key — translate to Claude /v1/messages format
     if (provider === "anthropic") {
@@ -335,7 +331,7 @@ export function buildUpstream(ctx: BuildContext): UpstreamResult {
         req: {
           url:     "https://api.anthropic.com/v1/messages",
           headers: buildClaudeHeaders(token, ctx.stream),
-          body:    openaiToClaude(model, ctx.body, ctx.stream, true),
+          body:    openaiToClaude(model, ctx.body, ctx.stream),
         },
         format: "claude",
       };

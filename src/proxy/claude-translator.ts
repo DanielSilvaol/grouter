@@ -1,256 +1,7 @@
 // OpenAI ↔ Anthropic/Claude translator.
 // Used by: kimi-coding (api.kimi.com/coding/v1/messages) and claude (OAuth).
-// Also handles /v1/messages ingress: claudeToOpenAI + openaiToClaudeResponse + openaiChunkToClaude.
 // Ported from 9router/open-sse/translator/request/openai-to-claude.js +
 //            9router/open-sse/translator/response/claude-to-openai.js
-
-import type { Connection } from "../types.ts";
-
-// ── Request: Anthropic /v1/messages → OpenAI /v1/chat/completions ────────────
-
-function claudeContentToOpenAI(role: string, content: unknown): Record<string, unknown>[] {
-  const messages: Record<string, unknown>[] = [];
-
-  if (role === "assistant") {
-    if (Array.isArray(content)) {
-      let text = "";
-      const toolCalls: Record<string, unknown>[] = [];
-      let tcIdx = 0;
-      for (const block of content as Record<string, unknown>[]) {
-        if (block.type === "text") text += block.text as string;
-        else if (block.type === "tool_use") {
-          toolCalls.push({
-            id: block.id, type: "function", index: tcIdx++,
-            function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
-          });
-        }
-      }
-      const m: Record<string, unknown> = { role: "assistant", content: text || null };
-      if (toolCalls.length) m.tool_calls = toolCalls;
-      messages.push(m);
-    } else {
-      messages.push({ role: "assistant", content: typeof content === "string" ? content : "" });
-    }
-    return messages;
-  }
-
-  // user role
-  if (Array.isArray(content)) {
-    const toolResults = (content as Record<string, unknown>[]).filter(b => b.type === "tool_result");
-    const other = (content as Record<string, unknown>[]).filter(b => b.type !== "tool_result");
-
-    for (const tr of toolResults) {
-      let trContent = "";
-      if (typeof tr.content === "string") trContent = tr.content;
-      else if (Array.isArray(tr.content)) {
-        trContent = (tr.content as Record<string, unknown>[])
-          .filter(b => b.type === "text").map(b => b.text as string).join("\n");
-      }
-      messages.push({ role: "tool", tool_call_id: tr.tool_use_id, content: trContent });
-    }
-
-    if (other.length) {
-      const parts: Record<string, unknown>[] = [];
-      for (const block of other) {
-        if (block.type === "text" && block.text) parts.push({ type: "text", text: block.text });
-        else if (block.type === "image") {
-          const src = block.source as Record<string, unknown> | undefined;
-          if (src?.type === "base64") parts.push({ type: "image_url", image_url: { url: `data:${src.media_type};base64,${src.data}` } });
-          else if (src?.type === "url") parts.push({ type: "image_url", image_url: { url: src.url } });
-        }
-      }
-      if (parts.length === 1 && parts[0].type === "text") messages.push({ role: "user", content: parts[0].text as string });
-      else if (parts.length > 0) messages.push({ role: "user", content: parts });
-    }
-  } else {
-    messages.push({ role: "user", content: typeof content === "string" ? content : "" });
-  }
-
-  return messages;
-}
-
-export function claudeToOpenAI(body: Record<string, unknown>): Record<string, unknown> {
-  const msgs: Record<string, unknown>[] = [];
-
-  const system = body.system;
-  if (system) {
-    let text = "";
-    if (typeof system === "string") text = system;
-    else if (Array.isArray(system)) {
-      text = (system as Record<string, unknown>[]).filter(b => b.type === "text").map(b => b.text as string).join("\n");
-    }
-    if (text) msgs.push({ role: "system", content: text });
-  }
-
-  for (const msg of (body.messages ?? []) as Record<string, unknown>[]) {
-    msgs.push(...claudeContentToOpenAI(msg.role as string, msg.content));
-  }
-
-  const result: Record<string, unknown> = {
-    model: body.model,
-    messages: msgs,
-    max_tokens: body.max_tokens ?? 8192,
-  };
-
-  if (body.temperature !== undefined) result.temperature = body.temperature;
-  if (body.top_p !== undefined) result.top_p = body.top_p;
-  if (body.stream !== undefined) result.stream = body.stream;
-
-  if (Array.isArray(body.tools) && (body.tools as unknown[]).length) {
-    result.tools = (body.tools as Record<string, unknown>[]).map(t => ({
-      type: "function",
-      function: { name: t.name, description: t.description ?? "", parameters: t.input_schema ?? { type: "object", properties: {} } },
-    }));
-  }
-
-  if (body.tool_choice) {
-    const tc = body.tool_choice as Record<string, unknown>;
-    if (tc.type === "auto") result.tool_choice = "auto";
-    else if (tc.type === "any") result.tool_choice = "required";
-    else if (tc.type === "none") result.tool_choice = "none";
-    else if (tc.type === "tool" && tc.name) result.tool_choice = { type: "function", function: { name: tc.name } };
-  }
-
-  return result;
-}
-
-// ── Response: OpenAI → Anthropic Message (non-stream) ────────────────────────
-
-export function openaiToClaudeResponse(data: Record<string, unknown>): Record<string, unknown> {
-  const choice = ((data.choices as unknown[]) ?? [])[0] as Record<string, unknown> | undefined;
-  const message = (choice?.message ?? {}) as Record<string, unknown>;
-
-  const content: Record<string, unknown>[] = [];
-  if (message.content && typeof message.content === "string") content.push({ type: "text", text: message.content });
-  if (Array.isArray(message.tool_calls)) {
-    for (const tc of message.tool_calls as Record<string, unknown>[]) {
-      const fn = tc.function as Record<string, unknown> | undefined;
-      content.push({ type: "tool_use", id: tc.id, name: fn?.name, input: tryJSON(fn?.arguments as string ?? "{}") });
-    }
-  }
-
-  const fr = choice?.finish_reason as string | undefined;
-  const stopReason = fr === "tool_calls" ? "tool_use" : fr === "length" ? "max_tokens" : "end_turn";
-  const usage = data.usage as Record<string, number> | undefined;
-
-  return {
-    id: data.id ?? `msg_${Date.now()}`,
-    type: "message",
-    role: "assistant",
-    model: data.model ?? "unknown",
-    content,
-    stop_reason: stopReason,
-    stop_sequence: null,
-    usage: { input_tokens: usage?.prompt_tokens ?? 0, output_tokens: usage?.completion_tokens ?? 0 },
-  };
-}
-
-// ── Response: OpenAI SSE → Anthropic SSE (stream) ────────────────────────────
-
-export interface OpenAIToClaudeStreamState {
-  messageId: string;
-  model: string;
-  blockIndex: number;
-  toolBlockMap: Map<number, number>;
-  textStarted: boolean;
-  toolBlocksClosed: boolean;
-  usage: Record<string, number> | null;
-}
-
-export function newOpenAIToClaudeStreamState(): OpenAIToClaudeStreamState {
-  return { messageId: "", model: "", blockIndex: 0, toolBlockMap: new Map(), textStarted: false, toolBlocksClosed: false, usage: null };
-}
-
-function sseClaudeEvent(type: string, data: Record<string, unknown>): string {
-  return `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
-}
-
-export function openaiChunkToClaude(line: string, state: OpenAIToClaudeStreamState): string[] {
-  if (!line.startsWith("data: ")) return [];
-  const jsonStr = line.slice(6).trim();
-
-  if (jsonStr === "[DONE]") {
-    const results: string[] = [];
-    if (state.textStarted) { results.push(sseClaudeEvent("content_block_stop", { index: 0 })); state.textStarted = false; }
-    if (!state.toolBlocksClosed) {
-      for (const blockIdx of state.toolBlockMap.values()) results.push(sseClaudeEvent("content_block_stop", { index: blockIdx }));
-      state.toolBlocksClosed = true;
-    }
-    const stopReason = state.toolBlockMap.size > 0 ? "tool_use" : "end_turn";
-    results.push(sseClaudeEvent("message_delta", {
-      delta: { type: "message_delta", stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: state.usage?.completion_tokens ?? 0 },
-    }));
-    results.push(sseClaudeEvent("message_stop", {}));
-    return results;
-  }
-
-  let chunk: Record<string, unknown>;
-  try { chunk = JSON.parse(jsonStr) as Record<string, unknown>; } catch { return []; }
-
-  const results: string[] = [];
-  const choice = ((chunk.choices as unknown[]) ?? [])[0] as Record<string, unknown> | undefined;
-  const delta = (choice?.delta ?? {}) as Record<string, unknown>;
-
-  // Emit message_start on first chunk
-  if (!state.messageId) {
-    state.messageId = (chunk.id as string) ?? `msg_${Date.now()}`;
-    state.model = (chunk.model as string) ?? "unknown";
-    results.push(sseClaudeEvent("message_start", {
-      message: {
-        id: state.messageId, type: "message", role: "assistant",
-        content: [], model: state.model, stop_reason: null, stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
-      },
-    }));
-  }
-
-  // Text delta
-  if (typeof delta.content === "string" && delta.content) {
-    if (!state.textStarted) {
-      state.textStarted = true;
-      results.push(sseClaudeEvent("content_block_start", { index: 0, content_block: { type: "text", text: "" } }));
-      if (state.blockIndex < 1) state.blockIndex = 1;
-    }
-    results.push(sseClaudeEvent("content_block_delta", { index: 0, delta: { type: "text_delta", text: delta.content } }));
-  }
-
-  // Tool call deltas
-  if (Array.isArray(delta.tool_calls)) {
-    for (const tc of delta.tool_calls as Record<string, unknown>[]) {
-      const tcIndex = tc.index as number;
-      const fn = tc.function as Record<string, unknown> | undefined;
-
-      if (!state.toolBlockMap.has(tcIndex)) {
-        const blockIdx = state.blockIndex++;
-        state.toolBlockMap.set(tcIndex, blockIdx);
-        results.push(sseClaudeEvent("content_block_start", {
-          index: blockIdx,
-          content_block: { type: "tool_use", id: tc.id ?? "", name: fn?.name ?? "", input: {} },
-        }));
-      }
-
-      if (fn?.arguments) {
-        results.push(sseClaudeEvent("content_block_delta", {
-          index: state.toolBlockMap.get(tcIndex)!,
-          delta: { type: "input_json_delta", partial_json: fn.arguments },
-        }));
-      }
-    }
-  }
-
-  // Accumulate usage
-  if (chunk.usage) state.usage = chunk.usage as Record<string, number>;
-
-  // Close blocks on finish_reason
-  if (choice?.finish_reason && !state.toolBlocksClosed) {
-    if (state.textStarted) { results.push(sseClaudeEvent("content_block_stop", { index: 0 })); state.textStarted = false; }
-    for (const blockIdx of state.toolBlockMap.values()) results.push(sseClaudeEvent("content_block_stop", { index: blockIdx }));
-    state.toolBlocksClosed = true;
-  }
-
-  return results;
-}
 
 // ── Request: OpenAI → Claude /v1/messages ────────────────────────────────────
 
@@ -258,6 +9,16 @@ function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.filter((c: { type: string; text?: string }) => c.type === "text").map((c: { text?: string }) => c.text ?? "").join("\n");
   return "";
+}
+
+function serializeContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content === null || content === undefined) return "";
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
 }
 
 function tryJSON(s: unknown): unknown {
@@ -270,7 +31,8 @@ function contentBlocks(msg: Record<string, unknown>): Record<string, unknown>[] 
   const role = msg.role as string;
 
   if (role === "tool") {
-    blocks.push({ type: "tool_result", tool_use_id: msg.tool_call_id, content: msg.content });
+    const normalizedContent = extractText(msg.content) || serializeContent(msg.content);
+    blocks.push({ type: "tool_result", tool_use_id: msg.tool_call_id, content: normalizedContent });
     return blocks;
   }
 
@@ -318,7 +80,6 @@ export function openaiToClaude(
   model: string,
   body: Record<string, unknown>,
   stream: boolean,
-  injectClaudeCodeId = false,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {
     model,
@@ -328,69 +89,46 @@ export function openaiToClaude(
 
   if (body.temperature !== undefined) result.temperature = body.temperature;
 
-  // System - OAuth Claude (claude-code beta) requires the first system block to identify
-  // the client as Claude Code. Without it, Anthropic rejects the request.
-  const CLAUDE_CODE_ID = "You are Claude Code, Anthropic's official CLI for Claude.";
+  // System
   const systemParts: string[] = [];
   const messages = (body.messages ?? []) as Record<string, unknown>[];
-  for (const msg of messages) { if (msg.role === "system") systemParts.push(extractText(msg.content)); }
-  const userSystem = systemParts.join("\n").trim();
-  if (injectClaudeCodeId) {
-    const systemBlocks: Record<string, unknown>[] = [{ type: "text", text: CLAUDE_CODE_ID }];
-    if (userSystem && !userSystem.startsWith(CLAUDE_CODE_ID)) {
-      systemBlocks.push({ type: "text", text: userSystem });
-    }
-    result.system = systemBlocks;
-  } else if (userSystem) {
-    result.system = [{ type: "text", text: userSystem }];
+  for (const msg of messages) {
+    if (msg.role === "system" || msg.role === "developer") systemParts.push(extractText(msg.content));
   }
+  if (systemParts.length) result.system = [{ type: "text", text: systemParts.join("\n") }];
 
-  // Messages: build Anthropic-compliant turn structure where every assistant message
-  // containing tool_use blocks is IMMEDIATELY followed by a user message containing the
-  // matching tool_result blocks. Consecutive same-role messages are merged.
-  const nonSystem = messages.filter(m => m.role !== "system");
+  // Messages (merge consecutive same-role, separate tool_result)
+  const nonSystem = messages.filter(m => m.role !== "system" && m.role !== "developer");
   const out: Record<string, unknown>[] = [];
   let curRole: string | undefined;
   let curParts: Record<string, unknown>[] = [];
-  let pendingToolResults: Record<string, unknown>[] = [];
 
   const flush = () => {
     if (curRole && curParts.length) { out.push({ role: curRole, content: curParts }); curParts = []; }
-  };
-  const flushPendingToolResults = () => {
-    if (pendingToolResults.length) {
-      out.push({ role: "user", content: pendingToolResults });
-      pendingToolResults = [];
-    }
   };
 
   for (const msg of nonSystem) {
     const newRole = (msg.role === "user" || msg.role === "tool") ? "user" : "assistant";
     const blocks = contentBlocks(msg);
-    const toolResults = blocks.filter(b => b.type === "tool_result");
-    const otherBlocks = blocks.filter(b => b.type !== "tool_result");
+    const hasToolResult = blocks.some(b => b.type === "tool_result");
 
-    if (toolResults.length) {
-      // Tool results must come in a 'user' message right after the assistant's tool_use.
-      // Flush any pending assistant turn first, then accumulate tool_results until they
-      // are followed by a non-tool_result message.
-      if (curRole === "assistant") flush();
-      pendingToolResults.push(...toolResults);
+    if (hasToolResult) {
+      flush();
+      out.push({ role: "user", content: blocks.filter(b => b.type === "tool_result") });
+      const other = blocks.filter(b => b.type !== "tool_result");
+      if (other.length) { curRole = newRole; curParts.push(...other); }
+      continue;
     }
-
-    if (otherBlocks.length) {
-      // Any non-tool_result block ends the tool_result accumulation.
-      flushPendingToolResults();
-      if (curRole !== newRole) { flush(); curRole = newRole; }
-      curParts.push(...otherBlocks);
-    }
+    if (curRole !== newRole) { flush(); curRole = newRole; }
+    curParts.push(...blocks);
+    if (blocks.some(b => b.type === "tool_use")) flush();
   }
   flush();
-  flushPendingToolResults();
   result.messages = out;
 
   // Tools
-  if (Array.isArray(body.tools) && (body.tools as unknown[]).length) {
+  const disableTools = body.tool_choice === "none";
+  if (!disableTools && Array.isArray(body.tools) && (body.tools as unknown[]).length) {
     result.tools = (body.tools as Record<string, unknown>[]).map(t => {
       if (t.type === "function" && t.function) {
         const fn = t.function as { name: string; description?: string; parameters?: unknown };
@@ -402,7 +140,7 @@ export function openaiToClaude(
 
   if (body.tool_choice) {
     const c = body.tool_choice;
-    if (c === "auto" || c === "none") result.tool_choice = { type: "auto" };
+    if (c === "auto") result.tool_choice = { type: "auto" };
     else if (c === "required") result.tool_choice = { type: "any" };
     else if (typeof c === "object" && (c as { function?: { name: string } }).function) result.tool_choice = { type: "tool", name: (c as { function: { name: string } }).function.name };
   }
@@ -620,4 +358,249 @@ export function translateClaudeNonStream(raw: Record<string, unknown>): Record<s
     choices: [{ index: 0, message, finish_reason: fr }],
     usage: { prompt_tokens: inp, completion_tokens: out, total_tokens: inp + out },
   };
+}
+
+// ── Request: Anthropic /v1/messages → OpenAI /v1/chat/completions ────────────
+// Used by the public /v1/messages endpoint to translate incoming Anthropic
+// Messages requests into the OpenAI shape that the rotation/upstream pipeline
+// already understands.
+
+function claudeContentToOpenAI(role: string, content: unknown): Record<string, unknown>[] {
+  const messages: Record<string, unknown>[] = [];
+
+  if (role === "assistant") {
+    if (Array.isArray(content)) {
+      let text = "";
+      const toolCalls: Record<string, unknown>[] = [];
+      let tcIdx = 0;
+      for (const block of content as Record<string, unknown>[]) {
+        if (block.type === "text") text += block.text as string;
+        else if (block.type === "tool_use") {
+          toolCalls.push({
+            id: block.id, type: "function", index: tcIdx++,
+            function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
+          });
+        }
+      }
+      const m: Record<string, unknown> = { role: "assistant", content: text || null };
+      if (toolCalls.length) m.tool_calls = toolCalls;
+      messages.push(m);
+    } else {
+      messages.push({ role: "assistant", content: typeof content === "string" ? content : "" });
+    }
+    return messages;
+  }
+
+  // user role: tool_results become separate `tool` messages, other blocks stay in user
+  if (Array.isArray(content)) {
+    const blocks = content as Record<string, unknown>[];
+    const toolResults = blocks.filter(b => b.type === "tool_result");
+    const other = blocks.filter(b => b.type !== "tool_result");
+
+    for (const tr of toolResults) {
+      let trContent = "";
+      if (typeof tr.content === "string") trContent = tr.content;
+      else if (Array.isArray(tr.content)) {
+        trContent = (tr.content as Record<string, unknown>[])
+          .filter(b => b.type === "text").map(b => b.text as string).join("\n");
+      }
+      messages.push({ role: "tool", tool_call_id: tr.tool_use_id, content: trContent });
+    }
+
+    if (other.length) {
+      const parts: Record<string, unknown>[] = [];
+      for (const block of other) {
+        if (block.type === "text" && block.text) parts.push({ type: "text", text: block.text });
+        else if (block.type === "image") {
+          const src = block.source as Record<string, unknown> | undefined;
+          if (src?.type === "base64") parts.push({ type: "image_url", image_url: { url: `data:${src.media_type};base64,${src.data}` } });
+          else if (src?.type === "url") parts.push({ type: "image_url", image_url: { url: src.url } });
+        }
+      }
+      if (parts.length === 1 && parts[0]!.type === "text") messages.push({ role: "user", content: parts[0]!.text as string });
+      else if (parts.length > 0) messages.push({ role: "user", content: parts });
+    }
+  } else {
+    messages.push({ role: "user", content: typeof content === "string" ? content : "" });
+  }
+
+  return messages;
+}
+
+export function claudeToOpenAI(body: Record<string, unknown>): Record<string, unknown> {
+  const msgs: Record<string, unknown>[] = [];
+
+  const system = body.system;
+  if (system) {
+    let text = "";
+    if (typeof system === "string") text = system;
+    else if (Array.isArray(system)) {
+      text = (system as Record<string, unknown>[]).filter(b => b.type === "text").map(b => b.text as string).join("\n");
+    }
+    if (text) msgs.push({ role: "system", content: text });
+  }
+
+  for (const msg of (body.messages ?? []) as Record<string, unknown>[]) {
+    msgs.push(...claudeContentToOpenAI(msg.role as string, msg.content));
+  }
+
+  const result: Record<string, unknown> = {
+    model: body.model,
+    messages: msgs,
+    max_tokens: body.max_tokens ?? 8192,
+  };
+
+  if (body.temperature !== undefined) result.temperature = body.temperature;
+  if (body.top_p !== undefined) result.top_p = body.top_p;
+  if (body.stream !== undefined) result.stream = body.stream;
+
+  if (Array.isArray(body.tools) && (body.tools as unknown[]).length) {
+    result.tools = (body.tools as Record<string, unknown>[]).map(t => ({
+      type: "function",
+      function: { name: t.name, description: t.description ?? "", parameters: t.input_schema ?? { type: "object", properties: {} } },
+    }));
+  }
+
+  if (body.tool_choice) {
+    const tc = body.tool_choice as Record<string, unknown>;
+    if (tc.type === "auto") result.tool_choice = "auto";
+    else if (tc.type === "any") result.tool_choice = "required";
+    else if (tc.type === "none") result.tool_choice = "none";
+    else if (tc.type === "tool" && tc.name) result.tool_choice = { type: "function", function: { name: tc.name } };
+  }
+
+  return result;
+}
+
+// ── Response: OpenAI → Anthropic Message (non-stream) ────────────────────────
+
+export function openaiToClaudeResponse(data: Record<string, unknown>): Record<string, unknown> {
+  const choice = ((data.choices as unknown[]) ?? [])[0] as Record<string, unknown> | undefined;
+  const message = (choice?.message ?? {}) as Record<string, unknown>;
+
+  const content: Record<string, unknown>[] = [];
+  if (message.content && typeof message.content === "string") content.push({ type: "text", text: message.content });
+  if (Array.isArray(message.tool_calls)) {
+    for (const tc of message.tool_calls as Record<string, unknown>[]) {
+      const fn = tc.function as Record<string, unknown> | undefined;
+      content.push({ type: "tool_use", id: tc.id, name: fn?.name, input: tryJSON(fn?.arguments as string ?? "{}") });
+    }
+  }
+
+  const fr = choice?.finish_reason as string | undefined;
+  const stopReason = fr === "tool_calls" ? "tool_use" : fr === "length" ? "max_tokens" : "end_turn";
+  const usage = data.usage as Record<string, number> | undefined;
+
+  return {
+    id: data.id ?? `msg_${Date.now()}`,
+    type: "message",
+    role: "assistant",
+    model: data.model ?? "unknown",
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: { input_tokens: usage?.prompt_tokens ?? 0, output_tokens: usage?.completion_tokens ?? 0 },
+  };
+}
+
+// ── Response: OpenAI SSE → Anthropic SSE (stream) ────────────────────────────
+
+export interface OpenAIToClaudeStreamState {
+  messageId: string;
+  model: string;
+  blockIndex: number;
+  toolBlockMap: Map<number, number>;
+  textStarted: boolean;
+  toolBlocksClosed: boolean;
+  usage: Record<string, number> | null;
+}
+
+export function newOpenAIToClaudeStreamState(): OpenAIToClaudeStreamState {
+  return { messageId: "", model: "", blockIndex: 0, toolBlockMap: new Map(), textStarted: false, toolBlocksClosed: false, usage: null };
+}
+
+function sseClaudeEvent(type: string, data: Record<string, unknown>): string {
+  return `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+}
+
+export function openaiChunkToClaude(line: string, state: OpenAIToClaudeStreamState): string[] {
+  if (!line.startsWith("data: ")) return [];
+  const jsonStr = line.slice(6).trim();
+
+  if (jsonStr === "[DONE]") {
+    const results: string[] = [];
+    if (state.textStarted) { results.push(sseClaudeEvent("content_block_stop", { index: 0 })); state.textStarted = false; }
+    if (!state.toolBlocksClosed) {
+      for (const blockIdx of state.toolBlockMap.values()) results.push(sseClaudeEvent("content_block_stop", { index: blockIdx }));
+      state.toolBlocksClosed = true;
+    }
+    const stopReason = state.toolBlockMap.size > 0 ? "tool_use" : "end_turn";
+    results.push(sseClaudeEvent("message_delta", {
+      delta: { type: "message_delta", stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: state.usage?.completion_tokens ?? 0 },
+    }));
+    results.push(sseClaudeEvent("message_stop", {}));
+    return results;
+  }
+
+  let chunk: Record<string, unknown>;
+  try { chunk = JSON.parse(jsonStr) as Record<string, unknown>; } catch { return []; }
+
+  const results: string[] = [];
+  const choice = ((chunk.choices as unknown[]) ?? [])[0] as Record<string, unknown> | undefined;
+  const delta = (choice?.delta ?? {}) as Record<string, unknown>;
+
+  if (!state.messageId) {
+    state.messageId = (chunk.id as string) ?? `msg_${Date.now()}`;
+    state.model = (chunk.model as string) ?? "unknown";
+    results.push(sseClaudeEvent("message_start", {
+      message: {
+        id: state.messageId, type: "message", role: "assistant",
+        content: [], model: state.model, stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    }));
+  }
+
+  if (typeof delta.content === "string" && delta.content) {
+    if (!state.textStarted) {
+      state.textStarted = true;
+      results.push(sseClaudeEvent("content_block_start", { index: 0, content_block: { type: "text", text: "" } }));
+      if (state.blockIndex < 1) state.blockIndex = 1;
+    }
+    results.push(sseClaudeEvent("content_block_delta", { index: 0, delta: { type: "text_delta", text: delta.content } }));
+  }
+
+  if (Array.isArray(delta.tool_calls)) {
+    for (const tc of delta.tool_calls as Record<string, unknown>[]) {
+      const tcIndex = tc.index as number;
+      const fn = tc.function as Record<string, unknown> | undefined;
+
+      if (!state.toolBlockMap.has(tcIndex)) {
+        const blockIdx = state.blockIndex++;
+        state.toolBlockMap.set(tcIndex, blockIdx);
+        results.push(sseClaudeEvent("content_block_start", {
+          index: blockIdx,
+          content_block: { type: "tool_use", id: tc.id ?? "", name: fn?.name ?? "", input: {} },
+        }));
+      }
+
+      if (fn?.arguments) {
+        results.push(sseClaudeEvent("content_block_delta", {
+          index: state.toolBlockMap.get(tcIndex)!,
+          delta: { type: "input_json_delta", partial_json: fn.arguments },
+        }));
+      }
+    }
+  }
+
+  if (chunk.usage) state.usage = chunk.usage as Record<string, number>;
+
+  if (choice?.finish_reason && !state.toolBlocksClosed) {
+    if (state.textStarted) { results.push(sseClaudeEvent("content_block_stop", { index: 0 })); state.textStarted = false; }
+    for (const blockIdx of state.toolBlockMap.values()) results.push(sseClaudeEvent("content_block_stop", { index: blockIdx }));
+    state.toolBlocksClosed = true;
+  }
+
+  return results;
 }

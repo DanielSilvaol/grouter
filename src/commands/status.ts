@@ -1,6 +1,5 @@
 import chalk from "chalk";
 import { listAccounts } from "../db/accounts.ts";
-import { getAccountById } from "../db/accounts.ts";
 import { getStrategy, getStickyLimit, getProxyPort } from "../db/index.ts";
 import { getActiveModelLocks } from "../rotator/lock.ts";
 import { formatDuration } from "../rotator/fallback.ts";
@@ -27,8 +26,6 @@ function bar(n: number, total: number, width = 14): string {
   const filled = Math.round((n / total) * width);
   return chalk.cyan("█".repeat(filled)) + chalk.gray("░".repeat(width - filled));
 }
-
-const SEP = chalk.gray("  " + "─".repeat(53));
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
@@ -68,10 +65,6 @@ export function statusCommand(): void {
       acc.test_status === "unavailable" && locks.length === 0 ? "active" : acc.test_status;
     return { ...acc, effective, locks };
   });
-
-  const active      = accountsWithStatus.filter((a) => a.is_active && a.effective === "active").length;
-  const unavailable = accountsWithStatus.filter((a) => a.effective === "unavailable").length;
-  const unknown     = accountsWithStatus.filter((a) => a.effective === "unknown" || a.effective === "").length;
 
   console.log(`  ${chalk.bold("Accounts")}  ${chalk.gray(`(${accounts.length} total)`)}`);
   for (const acc of accountsWithStatus) {

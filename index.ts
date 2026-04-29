@@ -60,8 +60,8 @@ program.command("setup")
 
 program.command("add")
   .description("Wizard — add a connection for any provider (OAuth, API key, import token)")
-  .option("--callback-host <host>", "Public IP/hostname for the OAuth callback — use on headless/VPS servers")
-  .option("--callback-port <port>", "Fixed port for the OAuth callback server (default: random ephemeral)")
+  .option("--callback-host <host>", "Public IP/hostname for the OAuth callback (headless/VPS)")
+  .option("--callback-port <port>", "Fixed port for the OAuth callback (default: ephemeral)")
   .action(addCommand);
 
 program.command("list").alias("ls")
@@ -101,7 +101,7 @@ program.command("keys [action] [arg...]")
 const serve = program.command("serve")
   .description("Manage the OpenAI-compatible proxy server")
   .option("-p, --port <number>", "Port to listen on (default: 3099)")
-  .action((opts: { port?: string }) => {
+  .action(() => {
     // bare `grouter serve` → show status
     serveStatusCommand();
   });
@@ -144,7 +144,7 @@ serve.command("fg")
 const upCmd = program.command("up")
   .description("Install integrations and providers");
 
-const upOpenclaude = upCmd.command("openclaude")
+upCmd.command("openclaude")
   .description("Configure Claude Code to use grouter (interactive wizard by default)")
   .option("--provider <id>", "Provider ID (e.g. claude, kiro, github, qwen)")
   .option("-m, --model <model>", "Model to use")

@@ -40,7 +40,7 @@ export function startCallbackListener(options?: {
   redirectHost?: string;      // public callback host shown to the provider/browser
 }): CallbackListener {
   const path = options?.path ?? DEFAULT_PATH;
-  const redirectHost = options?.redirectHost ?? "localhost";
+  const redirectHost = options?.redirectHost ?? "127.0.0.1";
   // `localhost` can resolve to IPv4 or IPv6 depending on OS/browser.
   // Bind dual-stack in that case to avoid callback refusal on one family.
   const bindHost = redirectHost === "localhost" ? "::" : redirectHost;
@@ -116,33 +116,59 @@ function escape(s: string): string {
 }
 
 /**
- * Creates a virtual CallbackListener whose promise is resolved externally - no HTTP server.
- * Used when GROUTER_PUBLIC_URL is set and the OAuth callback arrives via the main server route.
+ * A virtual CallbackListener that does not bind any port. Resolves only when
+ * an external caller invokes resolveRemote() — used by the headless / cloud
+ * deployment mode where the OAuth callback arrives at a public URL handled
+ * by the main proxy server (see GROUTER_PUBLIC_URL and the /oauth/callback
+ * route in src/web/api-auth.ts).
  */
+export interface RemoteCallbackListener extends CallbackListener {
+  resolveRemote(capture: CallbackCapture): void;
+}
+
 export function createRemoteCallbackListener(
   redirectUri: string,
-  timeoutMs = DEFAULT_TIMEOUT_MS,
-): CallbackListener & { resolveRemote(c: CallbackCapture): void } {
-  let resolver: ((c: CallbackCapture) => void) | null = null;
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): RemoteCallbackListener {
+  let resolver: ((cap: CallbackCapture) => void) | null = null;
+  let rejector: ((err: Error) => void) | null = null;
   let closed = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const cleanup = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+  };
 
   return {
     redirectUri,
     port: 0,
-    wait() {
-      return new Promise<CallbackCapture>((res, rej) => {
-        resolver = res;
-        timer = setTimeout(() => { if (!closed) rej(new Error("Callback timeout")); }, timeoutMs);
-        const orig = resolver;
-        resolver = (c) => { clearTimeout(timer!); orig(c); };
+    wait(overrideTimeoutMs?: number) {
+      return new Promise<CallbackCapture>((resolve, reject) => {
+        resolver = resolve;
+        rejector = reject;
+        timer = setTimeout(() => {
+          if (closed) return;
+          closed = true;
+          cleanup();
+          reject(new Error("Callback timeout"));
+        }, overrideTimeoutMs ?? timeoutMs);
       });
     },
     close() {
+      if (closed) return;
       closed = true;
-      if (timer) { clearTimeout(timer); timer = null; }
+      cleanup();
+      rejector?.(new Error("Callback listener closed"));
       resolver = null;
+      rejector = null;
     },
-    resolveRemote(c: CallbackCapture) { resolver?.(c); },
+    resolveRemote(capture: CallbackCapture) {
+      if (closed) return;
+      closed = true;
+      cleanup();
+      resolver?.(capture);
+      resolver = null;
+      rejector = null;
+    },
   };
 }

@@ -85,6 +85,25 @@ const res = await client.chat.completions.create({
 })
 ```
 
+Anthropic SDK clients (Claude Code, Cursor's anthropic mode, `@anthropic-ai/sdk`, etc.) work too via `POST /v1/messages` — same translation/rotation/retry pipeline, native Anthropic response shape:
+
+```ts
+import Anthropic from '@anthropic-ai/sdk'
+
+const client = new Anthropic({
+  baseURL: 'http://localhost:3099',
+  apiKey: 'any-value',
+})
+
+const msg = await client.messages.create({
+  model: 'anthropic/claude-sonnet-4-6',
+  max_tokens: 1024,
+  messages: [{ role: 'user', content: 'Hello!' }],
+})
+```
+
+Both endpoints (`/v1/chat/completions` and `/v1/messages`) are also available on every per-provider port (`:3100+`) — when you hit a pinned port, you can drop the `provider/` prefix from the model name.
+
 ---
 
 ## Providers
@@ -357,6 +376,7 @@ For non-trivial changes (new provider with odd OAuth flow, schema migration, rot
 
 - **Bugs & feature requests** → [GitHub Issues](https://github.com/GXDEVS/grouter/issues)
 - **Security issues** → do not open a public issue. Email the maintainer or use GitHub's private vulnerability reporting.
+- **HTTP API reference** → [`API.md`](./API.md) covers `/v1/chat/completions`, `/v1/messages`, `/v1/models`, error envelopes, CORS, and integration recipes.
 - **Architecture questions** → [`CLAUDE.md`](./CLAUDE.md) covers the request flow, DB schema, and provider-registry contract.
 
 ---
