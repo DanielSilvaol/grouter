@@ -14,6 +14,7 @@ RUN bun install --frozen-lockfile --ignore-scripts
 
 # Copy sources and build the single-file binary
 COPY tsconfig.json ./
+COPY CHANGELOG.md ./
 COPY scripts ./scripts
 COPY src ./src
 COPY index.ts ./

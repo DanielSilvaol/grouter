@@ -286,6 +286,45 @@ export async function handleAuthCallback(req: Request): Promise<Response> {
   }
 }
 
+// Body: { session_id: string; redirect_url: string }.
+// Completes an auth-code flow when the browser couldn't reach the local callback
+// listener — the user pastes the full redirect URL from the browser address bar.
+export async function handleAuthManual(req: Request): Promise<Response> {
+  try {
+    const body = await readJson<{ session_id?: string; redirect_url?: string }>(req);
+    if (!body.session_id) return errorResponse(400, "session_id required");
+    if (!body.redirect_url) return errorResponse(400, "redirect_url required");
+
+    const pending = pendingListeners.get(body.session_id);
+    if (!pending || pending.done) return errorResponse(410, "Session expired or already complete");
+
+    let code: string | null = null;
+    let state: string | null = null;
+    try {
+      const u = new URL(body.redirect_url);
+      code = u.searchParams.get("code");
+      state = u.searchParams.get("state");
+      // Claude may return code#state inside the code parameter
+      if (code?.includes("#")) {
+        const [left, right] = code.split("#");
+        code = left ?? code;
+        if (!state) state = right ?? null;
+      }
+    } catch {
+      return errorResponse(400, "Invalid redirect_url");
+    }
+
+    if (!code || !state) return errorResponse(400, "Could not extract code/state from redirect_url");
+
+    const connection = await completeAuthCodeFlow(body.session_id, code, state);
+    disposePending(body.session_id, pending);
+    ensureProviderServer(connection.provider);
+    return json({ status: "complete", account: connection });
+  } catch (err) {
+    return handleApiError(err);
+  }
+}
+
 // Body: { provider: string; input: string; meta?: Record<string, unknown> }.
 export async function handleAuthImport(req: Request): Promise<Response> {
   try {

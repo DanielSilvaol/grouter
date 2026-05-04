@@ -20,7 +20,7 @@ import { getProxyPort } from "../db/index.ts";
  * Multi-provider interactive `grouter add`.
  * Picks provider with arrow keys, then runs the right flow in-terminal.
  */
-export async function addCommand(opts: { callbackHost?: string; callbackPort?: string } = {}): Promise<void> {
+export async function addCommand(opts: { callbackHost?: string; callbackPort?: string; paste?: boolean } = {}): Promise<void> {
   console.log("");
 
   try {
@@ -138,7 +138,7 @@ async function runDeviceFlow(providerId: string): Promise<void> {
 async function runAuthCodeFlow(
   providerId: string,
   p: Provider,
-  opts: { callbackHost?: string; callbackPort?: string } = {},
+  opts: { callbackHost?: string; callbackPort?: string; paste?: boolean } = {},
 ): Promise<void> {
   const adapter = getAdapter(providerId)!;
 
@@ -155,6 +155,63 @@ async function runAuthCodeFlow(
       });
       if (v.trim()) meta[m.key] = v.trim();
     }
+  }
+
+  // PASTE MODE: no listener — redirect URI points to localhost on the user's machine.
+  // The browser gets redirected there, shows a connection error (nothing is listening),
+  // but the full URL with ?code=...&state=... is visible in the address bar.
+  // The user copies it and pastes it here to complete the flow.
+  if (opts.paste) {
+    const redirectUri = "http://localhost:54321/callback";
+    const started = startAuthCodeFlow(providerId, redirectUri, meta);
+
+    console.log("");
+    console.log(chalk.bold(`  Authorize ${p.name} in your browser:`));
+    console.log(`  ${chalk.cyan("URL:")}  ${chalk.underline(started.authUrl)}`);
+    console.log("");
+    console.log(chalk.gray("  Paste mode: the redirect points to localhost on your local machine."));
+    console.log(chalk.gray("  After authorizing, your browser will show a connection error — that's expected."));
+    console.log(chalk.gray("  Copy the full URL from the browser's address bar and paste it below.\n"));
+
+    try { await open(started.authUrl); } catch { /* ignore */ }
+
+    const pasted = await input({
+      message: "Paste the redirect URL here:",
+      validate: (v) => v.trim() ? true : "Paste the URL before continuing",
+    });
+
+    let code: string | null = null;
+    let state: string | null = null;
+
+    try {
+      const u = new URL(pasted.trim());
+      code = u.searchParams.get("code");
+      state = u.searchParams.get("state");
+      // Claude may return code#state inside the code parameter
+      if (code?.includes("#")) {
+        const [left, right] = code.split("#");
+        code = left ?? code;
+        if (!state) state = right ?? null;
+      }
+    } catch {
+      console.log(chalk.red("\n  Invalid URL.\n"));
+      return;
+    }
+
+    if (!code || !state) {
+      console.log(chalk.red("\n  Could not extract code/state from the URL.\n"));
+      return;
+    }
+
+    const exchanging = ora("Exchanging code for tokens...").start();
+    try {
+      const connection = await completeAuthCodeFlow(started.session_id, code, state);
+      exchanging.succeed(chalk.green("Authorization successful!"));
+      printSavedAccount(connection, p);
+    } catch (err) {
+      exchanging.fail(err instanceof Error ? err.message : String(err));
+    }
+    return;
   }
 
   const callbackHost = opts.callbackHost ?? adapter.callbackHost;

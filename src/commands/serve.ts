@@ -216,6 +216,12 @@ export function serveLogsCommand(): void {
 /** Called by the daemon child process — no decorations, just the server. */
 export function daemonEntrypoint(options: { port?: number }): void {
   const port = options.port ?? getProxyPort();
+  // Write our own PID so isRunning() returns true (covers `serve fg` in containers
+  // where no parent process writes the PID file).
+  writePid(process.pid);
+  process.on("exit", () => removePid());
+  process.on("SIGTERM", () => process.exit(0));
+  process.on("SIGINT",  () => process.exit(0));
   startAllServers(port);
 }
 

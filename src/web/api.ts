@@ -2,6 +2,7 @@ export {
   handleAuthAuthorize,
   handleAuthCallback,
   handleAuthImport,
+  handleAuthManual,
   handleAuthPoll,
   handleAuthStart,
   handleOAuthCallback,

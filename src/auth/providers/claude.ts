@@ -25,6 +25,7 @@ function normalize(tokens: Record<string, unknown>): NormalizedTokens {
 export const claudeAdapter: OAuthAdapter = {
   id: "claude",
   flow: "authorization_code_pkce",
+  callbackHost: "localhost",
 
   buildAuthUrl({ redirectUri, state, codeChallenge }) {
     if (!codeChallenge) throw new Error("codeChallenge required for Claude");
